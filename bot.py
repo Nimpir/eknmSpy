@@ -24,7 +24,7 @@ import discord.gateway
 from discord.ext import commands
 from pydub import AudioSegment
 
-from db import create_session, close_session
+from db import create_session, close_session, get_session, get_last_session_for_guild, get_conn
 
 # ── Compatibility patch ────────────────────────────────────────────────────────
 # Discord voice gateway (v8) requires DAVE E2E encryption fields in IDENTIFY.
@@ -49,26 +49,133 @@ async def _patched_identify(self):
 
 discord.gateway.DiscordVoiceWebSocket.identify = _patched_identify
 
-# ── DAVE audio patch ──────────────────────────────────────────────────────────
+# ── DAVE MLS integration ───────────────────────────────────────────────────────
 # py-cord 2.7.1 declares DAVE v1 support but never implements the MLS key
-# exchange, so every incoming audio frame fails Opus decoding and is silently
-# dropped (except OpusError: continue).
-# Patch: strip the DAVE supplemental frame (variable-length suffix after the
-# Opus payload) before handing bytes to the Opus decoder.  Discord appends
-# the DAVE frame as:  <opus_payload> <dave_suffix>
-# The Opus frame length is encoded in the first 2 bytes of the RTP extension
-# header when the DAVE extension is present; we fall back to trying raw decode
-# if no extension header is found.
+# exchange.  We patch:
+#   1. DiscordVoiceWebSocket.received_message — handle DAVE opcodes 25-30
+#   2. DecodeManager.run — DAVE-decrypt each audio frame before Opus decoding
+# The actual MLS state machine lives in dave_handler.DaveHandler.
 import discord.opus as _opus
 import discord.voice_client as _vc
+from dave_handler import DaveHandler
 
-_orig_decode_manager_run = _opus.DecodeManager.run
+_dave_log = logging.getLogger("dave_handler")
 
-_dave_log = logging.getLogger("dave_patch")
+
+# ── 1. Voice WebSocket — forward DAVE opcodes to the handler ─────────────────
+# Guard against double-patching on importlib.reload(): recover the real original
+# by following the _orig chain if the method was already patched by us.
+
+def _unwrap(fn):
+    """Follow _orig chain until we reach an unpatched function."""
+    while hasattr(fn, "_orig"):
+        fn = fn._orig
+    return fn
+
+_orig_received_message = _unwrap(
+    discord.gateway.DiscordVoiceWebSocket.received_message
+)
+
+# ── 0. SELECT_PROTOCOL — announce DAVE v1 support ────────────────────────────
+# Discord only sends DAVE binary frames if SELECT_PROTOCOL includes
+# dave_protocol_version: 1.  py-cord 2.7.1 omits this field.
+_orig_select_protocol = _unwrap(discord.gateway.DiscordVoiceWebSocket.select_protocol)
+
+async def _patched_select_protocol(self, ip, port, mode):
+    payload = {
+        "op": self.SELECT_PROTOCOL,
+        "d": {
+            "protocol": "udp",
+            "data": {"address": ip, "port": port, "mode": mode},
+            "dave_protocol_version": 1,
+        },
+    }
+    _dave_log.debug("SELECT_PROTOCOL dave_protocol_version=1 ip=%s port=%s mode=%s", ip, port, mode)
+    await self.send_as_json(payload)
+
+_patched_select_protocol._orig = _orig_select_protocol
+discord.gateway.DiscordVoiceWebSocket.select_protocol = _patched_select_protocol
+
+
+# ── 1a. received_message — auto-attach handler + JSON DAVE opcodes ───────────
+async def _patched_received_message(self, msg):
+    global _pending_dave_handler
+    op = msg.get("op")
+    _dave_log.debug("ws msg op=%s", op)
+    if op == 4:  # SESSION_DESCRIPTION — shows DAVE negotiation result
+        _dave_log.debug("SESSION_DESCRIPTION d=%s", msg.get("d"))
+    await _orig_received_message(self, msg)
+    handler: DaveHandler | None = getattr(self, "_dave", None)
+    # Auto-attach the pending handler the first time any TEXT message arrives
+    if handler is None and _pending_dave_handler is not None:
+        _pending_dave_handler.attach(self)
+        handler = _pending_dave_handler
+        _pending_dave_handler = None
+    # Log content of high opcodes we don't fully know yet
+    if op in (18, 20) or (op is not None and op >= 17 and op not in (18, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30)):
+        _dave_log.debug("unrecognised high op=%s d=%s", op, msg.get("d"))
+    # Handle JSON DAVE opcodes — op 20 observed in the wild as DAVE_PREPARE_EPOCH
+    # (Discord appears to use 20 instead of the documented 24 in current production)
+    if handler and op in (20, 21, 22, 24):
+        await handler.handle_json(self, msg)
+
+_patched_received_message._orig = _orig_received_message
+discord.gateway.DiscordVoiceWebSocket.received_message = _patched_received_message
+
+
+# ── 1b. poll_event — intercept binary DAVE frames ────────────────────────────
+# py-cord's poll_event only handles TEXT frames; binary frames are silently
+# dropped.  Discord sends all DAVE MLS messages as binary WebSocket frames.
+import aiohttp as _aiohttp
+from discord.errors import ConnectionClosed as _ConnectionClosed
+from discord import utils as _discord_utils
+
+_orig_poll_event = _unwrap(discord.gateway.DiscordVoiceWebSocket.poll_event)
+
+async def _patched_poll_event(self):
+    try:
+        msg = await asyncio.wait_for(self.ws.receive(), timeout=30.0)
+    except asyncio.TimeoutError:
+        _dave_log.debug("poll_event timeout — no WS message in 30s")
+        return
+    if msg.type is _aiohttp.WSMsgType.TEXT:
+        await self.received_message(_discord_utils._from_json(msg.data))
+    elif msg.type is _aiohttp.WSMsgType.BINARY:
+        _dave_log.debug("binary frame %d bytes", len(msg.data))
+        # Auto-attach pending handler on first binary frame too
+        global _pending_dave_handler
+        handler: DaveHandler | None = getattr(self, "_dave", None)
+        if handler is None and _pending_dave_handler is not None:
+            _pending_dave_handler.attach(self)
+            handler = _pending_dave_handler
+            _pending_dave_handler = None
+        if handler:
+            await handler.handle_binary(self, msg.data)
+    elif msg.type is _aiohttp.WSMsgType.ERROR:
+        _dave_log.debug("Voice WS error: %s", msg)
+        raise _ConnectionClosed(self.ws, shard_id=None) from msg.data
+    elif msg.type in (
+        _aiohttp.WSMsgType.CLOSED,
+        _aiohttp.WSMsgType.CLOSE,
+        _aiohttp.WSMsgType.CLOSING,
+    ):
+        _dave_log.debug("Voice WS closed: %s", msg)
+        raise _ConnectionClosed(self.ws, shard_id=None, code=self._close_code)
+
+_patched_poll_event._orig = _orig_poll_event
+discord.gateway.DiscordVoiceWebSocket.poll_event = _patched_poll_event
+
+# Pending handler set just before channel.connect() so it can be auto-attached
+# the moment the first DAVE opcode arrives (which happens during connect()).
+_pending_dave_handler: DaveHandler | None = None
+
+
+# ── 2. DecodeManager — DAVE-decrypt before Opus decode ───────────────────────
 
 def _patched_decode_manager_run(self):
-    import time, gc
+    import time
     from discord.opus import OpusError
+
     while not self._end_thread.is_set():
         try:
             data = self.decode_queue.pop(0)
@@ -78,30 +185,38 @@ def _patched_decode_manager_run(self):
 
         try:
             if data.decrypted_data is None:
+                _dave_log.debug("RTP decrypt returned None for ssrc=%s — dropping", data.ssrc)
                 continue
 
             raw = data.decrypted_data
+            _dave_log.debug("decode item ssrc=%s decrypted_len=%d", data.ssrc, len(raw))
 
-            # Try plain decode first
+            # Attempt DAVE decryption if the handler is ready
+            dave: DaveHandler | None = getattr(getattr(self.client, "ws", None), "_dave", None)
+            user_id = self.client.ws.ssrc_map.get(data.ssrc, {}).get("user_id")
+
+            opus_bytes = raw   # default: pass raw through
+            if dave and user_id is not None:
+                if dave.ready and not dave.can_passthrough(user_id):
+                    decrypted = dave.decrypt(user_id, raw)
+                    if decrypted is not None:
+                        opus_bytes = decrypted
+                    else:
+                        _dave_log.debug("DAVE decrypt returned None for ssrc=%s, skipping", data.ssrc)
+                        continue
+                elif dave.ready and dave.can_passthrough(user_id):
+                    # Try DAVE first, fall back to raw
+                    decrypted = dave.decrypt(user_id, raw)
+                    if decrypted is not None:
+                        opus_bytes = decrypted
+
             try:
-                data.decoded_data = self.get_decoder(data.ssrc).decode(raw)
+                data.decoded_data = self.get_decoder(data.ssrc).decode(opus_bytes)
             except OpusError:
-                # Possibly DAVE-wrapped: the real Opus frame is preceded by a
-                # 2-byte big-endian length field added by the DAVE extension.
-                # Try stripping increasing prefix lengths (2, 4, 8 bytes).
-                decoded = None
-                for skip in (2, 4, 8):
-                    if len(raw) > skip:
-                        try:
-                            decoded = self.get_decoder(data.ssrc).decode(raw[skip:])
-                            _dave_log.debug("DAVE strip: skipped %d bytes, decode OK", skip)
-                            break
-                        except OpusError:
-                            continue
-                if decoded is None:
-                    _dave_log.warning("OpusError on all decode attempts for SSRC %s, len=%d", data.ssrc, len(raw))
-                    continue
-                data.decoded_data = decoded
+                _dave_log.debug("OpusError ssrc=%s len=%d first4=%s",
+                                data.ssrc, len(opus_bytes),
+                                opus_bytes[:4].hex() if opus_bytes else "")
+                continue
 
         except Exception:
             _dave_log.exception("Unexpected error in DecodeManager")
@@ -109,64 +224,8 @@ def _patched_decode_manager_run(self):
 
         self.client.recv_decoded_audio(data)
 
+_patched_decode_manager_run._orig = _unwrap(_opus.DecodeManager.run)
 _opus.DecodeManager.run = _patched_decode_manager_run
-
-# Patch recv_audio to count raw UDP packets so we know if Discord sends any
-_orig_recv_audio = _vc.VoiceClient.recv_audio
-
-def _patched_recv_audio(self, sink, callback, *args):
-    import select, time
-    self.user_timestamps = {}
-    self.starting_time = time.perf_counter()
-    pkt_count = 0
-    while self.recording:
-        ready, _, err = select.select([self.socket], [], [self.socket], 0.01)
-        if not ready:
-            continue
-        try:
-            data = self.socket.recv(4096)
-        except OSError:
-            self.stop_recording()
-            continue
-        pkt_count += 1
-        if pkt_count == 1 or pkt_count % 500 == 0:
-            _dave_log.debug("UDP packets received: %d, last len=%d, byte1=0x%02x",
-                            pkt_count, len(data), data[1] if len(data) > 1 else 0)
-        self.unpack_audio(data)
-    _dave_log.debug("recv_audio ended, total UDP packets: %d", pkt_count)
-    self.stopping_time = time.perf_counter()
-    self.sink.cleanup()
-    import asyncio
-    cb = asyncio.run_coroutine_threadsafe(callback(sink, *args), self.loop)
-    cb.result()
-
-_vc.VoiceClient.recv_audio = _patched_recv_audio
-
-# Patch unpack_audio to log what decrypted_data looks like
-_orig_unpack_audio = _vc.VoiceClient.unpack_audio
-
-def _patched_unpack_audio(self, data):
-    from discord.sinks import RawData as _RawData
-    if data[1] & 0x78 != 0x78:
-        _dave_log.debug("unpack_audio: rejected PT byte=0x%02x", data[1])
-        return
-    if self.paused:
-        return
-    try:
-        rdata = _RawData(data, self)
-    except Exception as e:
-        _dave_log.warning("RawData init failed: %s", e)
-        return
-    if rdata.decrypted_data == b"\xf8\xff\xfe":
-        _dave_log.debug("unpack_audio: silence frame, skipping")
-        return
-    _dave_log.debug("unpack_audio: decrypted len=%d, first4=%s, ssrc=%s",
-                    len(rdata.decrypted_data),
-                    rdata.decrypted_data[:4].hex() if rdata.decrypted_data else "N/A",
-                    rdata.ssrc)
-    self.decoder.decode(rdata)
-
-_vc.VoiceClient.unpack_audio = _patched_unpack_audio
 # ──────────────────────────────────────────────────────────────────────────────
 
 log = logging.getLogger(__name__)
@@ -240,16 +299,25 @@ class MultiUserSink(discord.sinks.WaveSink):
         self.start_time = time.time()
 
     def write(self, data, user):
-        super().write(data, user)           # WaveSink accumulates audio_data
-        uid = user.id
-        pcm = data.data if hasattr(data, "data") else data
+        # py-cord passes a User object during recording but an int user_id
+        # from _process_audio_packet — handle both forms
+        uid  = user if isinstance(user, int) else user.id
+        if isinstance(user, int):
+            member = next(
+                (g.get_member(uid) for g in bot.guilds if g.get_member(uid)),
+                None
+            )
+            name = member.display_name if member else str(uid)
+        else:
+            name = user.display_name
+        pcm  = data.data if hasattr(data, "data") else data
         with self._lock:
             if uid not in self._ring:
-                log.debug("First audio packet from user %s (%s), pcm_len=%d", uid, user.display_name, len(pcm))
+                log.debug("First audio packet from user %s (%s), pcm_len=%d", uid, name, len(pcm))
                 self._ring[uid]  = RingBuffer(
                     RING_BUFFER_SEC, SAMPLE_RATE, CHANNELS, SAMPLE_WIDTH
                 )
-                self._names[uid] = user.display_name
+                self._names[uid] = name
             self._ring[uid].push(pcm)
 
     def get_ring_clip(self, n_seconds: int) -> bytes:
@@ -274,17 +342,19 @@ class MultiUserSink(discord.sinks.WaveSink):
         """Write per-user WAV files, return {user_id: path}."""
         paths = {}
         with self._lock:
-            names = dict(self._names)
-        log.debug("save_all_users: audio_data has %d user(s): %s", len(self.audio_data), list(self.audio_data.keys()))
-        for uid, audio in self.audio_data.items():
-            wav_bytes = audio.file.getvalue()
-            if not wav_bytes:
+            names    = dict(self._names)
+            ring_pcm = {uid: rb.get_last_n_seconds(RING_BUFFER_SEC)
+                        for uid, rb in self._ring.items()}
+        log.debug("save_all_users: ring has %d user(s): %s", len(ring_pcm), list(ring_pcm.keys()))
+        for uid, pcm in ring_pcm.items():
+            if not pcm:
+                log.debug("save_all_users: user %s has empty ring buffer, skipping", uid)
                 continue
             safe_name = names.get(uid, str(uid)).replace(" ", "_")
             wav_path  = self.session_dir / f"{safe_name}_{uid}.wav"
-            with open(wav_path, "wb") as f:
-                f.write(wav_bytes)
+            _write_wav(wav_path, pcm)
             paths[uid] = wav_path
+            log.info("save_all_users: wrote %s (%d bytes PCM)", wav_path.name, len(pcm))
         return paths
 
     def get_speaker_map(self) -> dict[int, str]:
@@ -313,7 +383,7 @@ def pcm_to_wav_bytes(pcm: bytes) -> bytes:
 
 def mix_to_mono_wav(session_dir: Path, out_path: Path):
     """Merge all per-user WAV files into one mono 16kHz WAV for Whisper."""
-    wavs = list(session_dir.glob("*.wav"))
+    wavs = [p for p in session_dir.glob("*.wav") if p.name != "mixed_mono.wav"]
     if not wavs:
         return
     combined = None
@@ -335,6 +405,7 @@ _voice_client:        discord.VoiceClient | None = None
 _session_id:          int | None = None
 _session_dir:         Path | None = None
 _session_log_handler: logging.Handler | None = None
+_dave_handler:        DaveHandler | None = None
 
 # callback so GUI can react to bot events
 on_session_started = None   # callable(session_id, session_name)
@@ -375,7 +446,7 @@ async def on_ready():
 
 @bot.slash_command(name="join", description="Join a voice channel and start recording")
 async def join(ctx: discord.ApplicationContext):
-    global _active_sink, _voice_client, _session_id, _session_dir
+    global _active_sink, _voice_client, _session_id, _session_dir, _session_log_handler, _dave_handler, _pending_dave_handler
 
     if not ctx.author.voice:
         await ctx.respond("❌ You must be in a voice channel first.", ephemeral=True)
@@ -389,7 +460,16 @@ async def join(ctx: discord.ApplicationContext):
 
     await ctx.defer()
 
+    # Create DAVE handler BEFORE connecting — OP 25 arrives during connect()
+    # and must not be missed. _patched_received_message will auto-attach it.
+    _pending_dave_handler = DaveHandler(
+        user_id=bot.user.id,
+        channel_id=channel.id,
+    )
+    _dave_handler = _pending_dave_handler   # keep reference for cleanup
+
     _voice_client = await channel.connect()
+
 
     # Wait up to 5 s for the voice WebSocket handshake to fully complete
     for _ in range(50):
@@ -413,6 +493,9 @@ async def join(ctx: discord.ApplicationContext):
               vs.self_deaf if vs else "N/A",
               vs.self_mute if vs else "N/A",
               vs.channel.name if vs and vs.channel else "N/A")
+
+    log.info("DAVE handler ready=%s status=%s",
+             _dave_handler.ready, _dave_handler.status)
 
     safe_channel = re.sub(r"[^\w-]", "_", unidecode(channel.name))
     session_name = f"{safe_channel}_{datetime.now().strftime('%Y-%m-%d_%H-%M')}"
@@ -441,47 +524,102 @@ async def _on_recording_done(sink: MultiUserSink, channel, *args):
     pass  # handled in /leave
 
 
+async def _do_leave(notify_channel=None):
+    """Stop recording, save files, fire callbacks. Shared by /leave and auto-leave."""
+    global _active_sink, _voice_client, _session_id, _session_dir, _session_log_handler, _dave_handler
+
+    if _voice_client is None or _active_sink is None:
+        log.warning("_do_leave called but not recording — ignoring")
+        return
+
+    _voice_client.stop_recording()
+    await _voice_client.disconnect()
+
+    user_wavs   = _active_sink.save_all_users()
+    speaker_map = _active_sink.get_speaker_map()
+
+    mixed_path = _session_dir / "mixed_mono.wav"
+    await asyncio.get_running_loop().run_in_executor(
+        None, mix_to_mono_wav, _session_dir, mixed_path
+    )
+
+    sid = _session_id
+    close_session(sid)
+
+    if notify_channel:
+        await notify_channel.send(
+            f"⏹️ Recording stopped. Session ID: **{sid}**\n"
+            f"Use `/transcript` to generate and retrieve the transcript."
+        )
+
+    if on_session_stopped:
+        on_session_stopped(sid, str(mixed_path), speaker_map)
+
+    log.info("Session ended: id=%s", sid)
+    if _session_log_handler:
+        _detach_session_log(_session_log_handler)
+    if _dave_handler:
+        _dave_handler.detach()
+
+    _voice_client        = None
+    _active_sink         = None
+    _session_log_handler = None
+    _dave_handler        = None
+
+
+_auto_leave_task: asyncio.Task | None = None
+
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    global _auto_leave_task
+
+    if not _voice_client or not _voice_client.is_connected():
+        return
+
+    channel = _voice_client.channel
+    if channel is None:
+        return
+
+    # Count non-bot members still in the channel (excluding the bot itself)
+    human_members = [m for m in channel.members if not m.bot]
+    if human_members:
+        # Someone is still here — cancel any pending auto-leave
+        if _auto_leave_task and not _auto_leave_task.done():
+            _auto_leave_task.cancel()
+            _auto_leave_task = None
+            log.info("Auto-leave cancelled — humans still present")
+        return
+
+    # Bot is alone — schedule auto-leave in 5 s (avoid double-scheduling)
+    if _auto_leave_task and not _auto_leave_task.done():
+        return
+
+    log.info("Bot is alone in channel — auto-leaving in 5 s")
+
+    async def _delayed_leave():
+        await asyncio.sleep(5)
+        if _voice_client and _voice_client.is_connected():
+            log.info("Auto-leave triggered")
+            await _do_leave(notify_channel=None)
+
+    _auto_leave_task = asyncio.create_task(_delayed_leave())
+
+
 @bot.slash_command(name="leave", description="Stop recording and leave the channel")
 async def leave(ctx: discord.ApplicationContext):
-    global _active_sink, _voice_client, _session_id, _session_dir, _session_log_handler
+    global _auto_leave_task
 
     if not _voice_client or not _voice_client.is_connected():
         await ctx.respond("❌ Not recording.", ephemeral=True)
         return
 
+    if _auto_leave_task and not _auto_leave_task.done():
+        _auto_leave_task.cancel()
+        _auto_leave_task = None
+
     await ctx.defer()
-
-    _voice_client.stop_recording()
-    await _voice_client.disconnect()
-
-    # save per-user wavs
-    user_wavs = _active_sink.save_all_users()
-    speaker_map = _active_sink.get_speaker_map()
-
-    # mix to mono for whisper
-    mixed_path = _session_dir / "mixed_mono.wav"
-    await asyncio.get_event_loop().run_in_executor(
-        None, mix_to_mono_wav, _session_dir, mixed_path
-    )
-
-    close_session(_session_id)
-
-    await ctx.followup.send(
-        f"⏹️ Recording stopped. Files saved:\n"
-        + "\n".join(f"• {p.name}" for p in user_wavs.values())
-        + f"\n\nUse the GUI to transcribe (`{mixed_path}`)"
-    )
-
-    if on_session_stopped:
-        on_session_stopped(_session_id, str(mixed_path), speaker_map)
-
-    log.info("Session ended: id=%s", _session_id)
-    if _session_log_handler:
-        _detach_session_log(_session_log_handler)
-
-    _voice_client        = None
-    _active_sink         = None
-    _session_log_handler = None
+    await _do_leave(notify_channel=ctx.channel)
 
 
 @bot.slash_command(name="save", description="Save the last N minutes of audio (1-10)")
@@ -506,6 +644,127 @@ async def save_clip(ctx: discord.ApplicationContext, minutes: int = 5):
     await ctx.followup.send(
         f"🎵 Last **{minutes} min** of audio:",
         file=discord.File(fp=__import__("io").BytesIO(wav), filename=name)
+    )
+
+
+@bot.slash_command(name="sessions", description="List all recorded sessions for this server")
+async def list_sessions(ctx: discord.ApplicationContext):
+    guild_name = ctx.guild.name
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT id, name, started_at, ended_at, channel
+               FROM sessions WHERE guild=? ORDER BY started_at DESC""",
+            (guild_name,)
+        ).fetchall()
+
+    if not rows:
+        await ctx.respond("❌ No sessions found for this server.", ephemeral=True)
+        return
+
+    lines = []
+    for r in rows:
+        date  = r["started_at"][:16].replace("T", " ") if r["started_at"] else "?"
+        ended = r["ended_at"][:16].replace("T", " ")   if r["ended_at"]   else "ongoing"
+        has_transcript = (RECORDINGS_DIR / r["name"] / "transcript.txt").exists()
+        flag  = "📝" if has_transcript else "🎙️"
+        lines.append(f"{flag} **ID {r['id']}** — {date} → {ended}  |  #{r['channel'] or '?'}  |  `{r['name']}`")
+
+    header  = f"**Sessions for {guild_name}** ({len(rows)} total)\n📝 = transcript ready  🎙️ = not yet transcribed\n\n"
+    body    = "\n".join(lines)
+    message = header + body
+
+    # Discord message limit is 2000 chars — paginate if needed
+    if len(message) <= 2000:
+        await ctx.respond(message)
+    else:
+        await ctx.defer()
+        chunks, current = [], header
+        for line in lines:
+            if len(current) + len(line) + 1 > 2000:
+                chunks.append(current)
+                current = ""
+            current += line + "\n"
+        if current:
+            chunks.append(current)
+        await ctx.followup.send(chunks[0])
+        for chunk in chunks[1:]:
+            await ctx.followup.send(chunk)
+
+
+@bot.slash_command(name="transcript", description="Get the transcript for a session")
+@discord.option("id", description="Session ID (omit for the latest session)", required=False, default=None)
+async def get_transcript(ctx: discord.ApplicationContext, id: int = None):
+    guild_name = ctx.guild.name
+
+    # ── Resolve session ────────────────────────────────────────────────────────
+    if id is not None:
+        row = get_session(id)
+        if row is None:
+            await ctx.respond(f"❌ Session **{id}** not found.", ephemeral=True)
+            return
+        if row["guild"] != guild_name:
+            await ctx.respond(
+                f"❌ Session **{id}** does not belong to this server.", ephemeral=True
+            )
+            return
+    else:
+        row = get_last_session_for_guild(guild_name)
+        if row is None:
+            await ctx.respond("❌ No sessions found for this server.", ephemeral=True)
+            return
+
+    session_id   = row["id"]
+    session_name = row["name"]
+    session_dir  = RECORDINGS_DIR / session_name
+    txt_path     = session_dir / "transcript.txt"
+    html_path    = session_dir / "transcript.html"
+
+    # ── Return existing files if available ────────────────────────────────────
+    if txt_path.exists() and html_path.exists():
+        files = [
+            discord.File(str(txt_path),  filename=txt_path.name),
+            discord.File(str(html_path), filename=html_path.name),
+        ]
+        await ctx.respond(
+            f"📝 **Transcript:** `{session_name}` (Session ID: {session_id})",
+            files=files,
+        )
+        return
+
+    # ── No transcript yet — run pipeline ──────────────────────────────────────
+    mixed_wav = session_dir / "mixed_mono.wav"
+    if not mixed_wav.exists():
+        await ctx.respond(
+            f"❌ No audio found for session **{session_id}**. "
+            "The recording may not have been saved yet.",
+            ephemeral=True,
+        )
+        return
+
+    await ctx.defer()
+    log.info("Transcript command: running pipeline for session %s", session_id)
+
+    def _run_pipeline():
+        from processor import process_session, export_txt, export_html
+        segs = process_session(str(mixed_wav), session_id)
+        export_txt(segs, str(txt_path))
+        export_html(segs, str(html_path), session_name=session_name)
+
+    try:
+        await asyncio.get_running_loop().run_in_executor(None, _run_pipeline)
+    except Exception as e:
+        log.exception("Transcript pipeline failed for session %s", session_id)
+        await ctx.followup.send(f"❌ Transcription failed: {e}")
+        return
+
+    files = [
+        discord.File(str(p), filename=p.name)
+        for p in (txt_path, html_path)
+        if p.exists()
+    ]
+    await ctx.followup.send(
+        f"📝 **Transcript ready:** `{session_name}` (Session ID: {session_id})",
+        files=files,
     )
 
 

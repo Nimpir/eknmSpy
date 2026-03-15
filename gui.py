@@ -45,25 +45,27 @@ class App(tk.Tk):
         self._bot_thread = None
         self._build_ui()
         self._refresh_sessions()
+        if os.getenv("DISCORD_TOKEN", ""):
+            self.after(500, self._safe_start_bot)
 
     # ── UI construction ───────────────────────────────────────────────────────
 
     def _build_ui(self):
         self._style()
-        nb = ttk.Notebook(self)
-        nb.pack(fill="both", expand=True, padx=8, pady=8)
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill="both", expand=True, padx=8, pady=8)
 
-        self.tab_sessions  = ttk.Frame(nb, style="Dark.TFrame")
-        self.tab_process   = ttk.Frame(nb, style="Dark.TFrame")
-        self.tab_log       = ttk.Frame(nb, style="Dark.TFrame")
-        self.tab_search    = ttk.Frame(nb, style="Dark.TFrame")
-        self.tab_bot       = ttk.Frame(nb, style="Dark.TFrame")
+        self.tab_sessions  = ttk.Frame(self.notebook, style="Dark.TFrame")
+        self.tab_process   = ttk.Frame(self.notebook, style="Dark.TFrame")
+        self.tab_log       = ttk.Frame(self.notebook, style="Dark.TFrame")
+        self.tab_search    = ttk.Frame(self.notebook, style="Dark.TFrame")
+        self.tab_bot       = ttk.Frame(self.notebook, style="Dark.TFrame")
 
-        nb.add(self.tab_sessions, text="  📁 Sessions  ")
-        nb.add(self.tab_process,  text="  ⚙️ Processing  ")
-        nb.add(self.tab_log,      text="  📄 Log  ")
-        nb.add(self.tab_search,   text="  🔍 Search  ")
-        nb.add(self.tab_bot,      text="  🤖 Bot  ")
+        self.notebook.add(self.tab_sessions, text="  📁 Sessions  ")
+        self.notebook.add(self.tab_process,  text="  ⚙️ Processing  ")
+        self.notebook.add(self.tab_log,      text="  📄 Log  ")
+        self.notebook.add(self.tab_search,   text="  🔍 Search  ")
+        self.notebook.add(self.tab_bot,      text="  🤖 Bot  ")
 
         self._build_sessions_tab()
         self._build_process_tab()
@@ -111,6 +113,7 @@ class App(tk.Tk):
             self.sessions_tree.heading(col, text=label)
             self.sessions_tree.column(col, width=w, anchor="w")
         self.sessions_tree.pack(fill="both", expand=True, padx=12, pady=4)
+        self.sessions_tree.bind("<Double-1>", lambda _: self._send_to_process())
 
         btns = ttk.Frame(f, style="Dark.TFrame")
         btns.pack(fill="x", padx=12, pady=8)
@@ -146,9 +149,14 @@ class App(tk.Tk):
     def _send_to_process(self):
         sid = self._selected_session_id()
         if sid:
-            # switch to process tab and pre-fill
-            self.nametowidget(".").children["!notebook"].select(1)
+            self.notebook.select(self.tab_process)
             self._process_session_id.set(sid)
+            with get_conn() as conn:
+                row = conn.execute("SELECT name FROM sessions WHERE id=?", (sid,)).fetchone()
+            if row:
+                wav = Path("data/recordings") / row["name"] / "mixed_mono.wav"
+                if wav.exists():
+                    self._audio_path.set(str(wav))
 
     # ── Process tab ───────────────────────────────────────────────────────────
 
@@ -217,11 +225,12 @@ class App(tk.Tk):
             out_dir = Path(audio).parent
 
             def progress(step, pct):
-                self._progress_var.set(pct)
-                self._progress_label.config(text=step)
-                self._process_log.insert("end", f"[{pct:3d}%] {step}\n")
-                self._process_log.see("end")
-                self.update_idletasks()
+                def _update():
+                    self._progress_var.set(pct)
+                    self._progress_label.config(text=step)
+                    self._process_log.insert("end", f"[{pct:3d}%] {step}\n")
+                    self._process_log.see("end")
+                self.after(0, _update)
 
             try:
                 segments = process_session(audio, sid, progress_cb=progress)
@@ -241,12 +250,11 @@ class App(tk.Tk):
                 )
                 self._process_log.see("end")
                 self._refresh_sessions()
-                messagebox.showinfo("Done", f"Transcription complete!\n\n{txt_path}")
+                self._load_log(sid)
 
             except Exception as e:
                 log.exception("Processing failed for session %s", sid)
                 self._process_log.insert("end", f"\n❌ Error: {e}\n")
-                messagebox.showerror("Processing Error", str(e))
             finally:
                 self._process_btn.config(state="normal")
 
@@ -291,7 +299,7 @@ class App(tk.Tk):
 
         from processor import fmt_time
         for s in segs:
-            time_str = f"[{fmt_time(s['start'])}]  "
+            time_str = f"[{fmt_time(s['start_sec'])}]  "
             name_str = f"{s['speaker']}: "
             text_str = f"{s['text']}\n"
             self._log_text.insert("end", time_str, "dim")
@@ -304,7 +312,7 @@ class App(tk.Tk):
         with get_conn() as conn:
             row = conn.execute("SELECT name FROM sessions WHERE id=?", (session_id,)).fetchone()
         if row:
-            self._current_html_path = Path("data/recordings") / row["name"] / "transcript.html"
+            self._current_html_path = (Path(__file__).parent / "data/recordings" / row["name"] / "transcript.html").resolve()
 
     def _open_html(self):
         if self._current_html_path and self._current_html_path.exists():
@@ -380,9 +388,11 @@ class App(tk.Tk):
 
         ttk.Label(f, text="Bot commands in Discord:", style="Dark.TLabel").pack(anchor="w", padx=12, pady=(16,4))
         cmds = (
-            ("/join",     "Join a voice channel and start recording"),
-            ("/leave",    "Stop recording, save files"),
-            ("/save N",   "Save the last N minutes as an audio file (1–10)"),
+            ("/join",          "Join a voice channel and start recording"),
+            ("/leave",         "Stop recording and save files (returns session ID)"),
+            ("/sessions",      "List all sessions for this server with ID and date"),
+            ("/transcript",    "Get transcript for last session (or /transcript <id>)"),
+            ("/save N",        "Save the last N minutes as an audio file (1–10)"),
         )
         for cmd, desc in cmds:
             row = ttk.Frame(f, style="Dark.TFrame")
@@ -399,6 +409,12 @@ class App(tk.Tk):
         # redirect bot stdout to log widget
         self._orig_stdout = sys.stdout
 
+    def _safe_start_bot(self):
+        try:
+            self._start_bot()
+        except Exception:
+            log.exception("Auto-start bot failed")
+
     def _start_bot(self):
         token = self._token_var.get().strip()
         if not token:
@@ -412,15 +428,19 @@ class App(tk.Tk):
         importlib.reload(discord_bot)
 
         def session_started(sid, name):
-            self._bot_log.insert("end", f"🎙️ Session started: {name} (ID={sid})\n")
-            self._bot_log.see("end")
+            def _update():
+                self._bot_log.insert("end", f"🎙️ Session started: {name} (ID={sid})\n")
+                self._bot_log.see("end")
+            self.after(0, _update)
 
         def session_stopped(sid, wav_path, speaker_map):
-            self._bot_log.insert("end", f"⏹️ Session {sid} finished. WAV: {wav_path}\n")
-            self._bot_log.see("end")
-            self._audio_path.set(wav_path)
-            self._process_session_id.set(sid)
-            self._refresh_sessions()
+            def _update():
+                self._bot_log.insert("end", f"⏹️ Session {sid} finished. WAV: {wav_path}\n")
+                self._bot_log.see("end")
+                self._audio_path.set(wav_path)
+                self._process_session_id.set(sid)
+                self._refresh_sessions()
+            self.after(0, _update)
 
         discord_bot.on_session_started = session_started
         discord_bot.on_session_stopped = session_stopped

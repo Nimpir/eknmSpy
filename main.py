@@ -4,11 +4,17 @@ main.py — entry point, loads .env and launches GUI
 import io
 import os
 import sys
+import warnings
 import logging
 import logging.handlers
 import threading
 from datetime import datetime
 from pathlib import Path
+
+# Suppress torchcodec warning from pyannote (we load audio via scipy instead)
+warnings.filterwarnings("ignore", category=UserWarning, module="pyannote.audio.core.io")
+warnings.filterwarnings("ignore", category=UserWarning, module="pyannote.audio.models.blocks.pooling")
+warnings.filterwarnings("ignore", module="pyannote.audio.utils.reproducibility")
 
 # Load .env if present
 env_path = Path(__file__).parent / ".env"
@@ -49,7 +55,7 @@ logging.getLogger("gui").setLevel(logging.DEBUG)
 logging.getLogger("processor").setLevel(logging.DEBUG)
 logging.getLogger("db").setLevel(logging.DEBUG)
 logging.getLogger("discord").setLevel(logging.WARNING)
-logging.getLogger("dave_patch").setLevel(logging.DEBUG)
+logging.getLogger("dave_handler").setLevel(logging.DEBUG)
 
 # Route unhandled thread exceptions and stderr into the log
 _stderr_log = logging.getLogger("stderr")

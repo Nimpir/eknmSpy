@@ -77,6 +77,21 @@ def insert_segments(session_id: int, segments: list[dict]):
         )
 
 
+def get_session(session_id: int):
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT * FROM sessions WHERE id=?", (session_id,)
+        ).fetchone()
+
+
+def get_last_session_for_guild(guild: str):
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT * FROM sessions WHERE guild=? ORDER BY started_at DESC LIMIT 1",
+            (guild,)
+        ).fetchone()
+
+
 def get_sessions() -> list:
     with get_conn() as conn:
         return conn.execute(
