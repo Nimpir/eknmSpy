@@ -48,6 +48,125 @@ async def _patched_identify(self):
     await self.send_as_json(payload)
 
 discord.gateway.DiscordVoiceWebSocket.identify = _patched_identify
+
+# ── DAVE audio patch ──────────────────────────────────────────────────────────
+# py-cord 2.7.1 declares DAVE v1 support but never implements the MLS key
+# exchange, so every incoming audio frame fails Opus decoding and is silently
+# dropped (except OpusError: continue).
+# Patch: strip the DAVE supplemental frame (variable-length suffix after the
+# Opus payload) before handing bytes to the Opus decoder.  Discord appends
+# the DAVE frame as:  <opus_payload> <dave_suffix>
+# The Opus frame length is encoded in the first 2 bytes of the RTP extension
+# header when the DAVE extension is present; we fall back to trying raw decode
+# if no extension header is found.
+import discord.opus as _opus
+import discord.voice_client as _vc
+
+_orig_decode_manager_run = _opus.DecodeManager.run
+
+_dave_log = logging.getLogger("dave_patch")
+
+def _patched_decode_manager_run(self):
+    import time, gc
+    from discord.opus import OpusError
+    while not self._end_thread.is_set():
+        try:
+            data = self.decode_queue.pop(0)
+        except IndexError:
+            time.sleep(0.001)
+            continue
+
+        try:
+            if data.decrypted_data is None:
+                continue
+
+            raw = data.decrypted_data
+
+            # Try plain decode first
+            try:
+                data.decoded_data = self.get_decoder(data.ssrc).decode(raw)
+            except OpusError:
+                # Possibly DAVE-wrapped: the real Opus frame is preceded by a
+                # 2-byte big-endian length field added by the DAVE extension.
+                # Try stripping increasing prefix lengths (2, 4, 8 bytes).
+                decoded = None
+                for skip in (2, 4, 8):
+                    if len(raw) > skip:
+                        try:
+                            decoded = self.get_decoder(data.ssrc).decode(raw[skip:])
+                            _dave_log.debug("DAVE strip: skipped %d bytes, decode OK", skip)
+                            break
+                        except OpusError:
+                            continue
+                if decoded is None:
+                    _dave_log.warning("OpusError on all decode attempts for SSRC %s, len=%d", data.ssrc, len(raw))
+                    continue
+                data.decoded_data = decoded
+
+        except Exception:
+            _dave_log.exception("Unexpected error in DecodeManager")
+            continue
+
+        self.client.recv_decoded_audio(data)
+
+_opus.DecodeManager.run = _patched_decode_manager_run
+
+# Patch recv_audio to count raw UDP packets so we know if Discord sends any
+_orig_recv_audio = _vc.VoiceClient.recv_audio
+
+def _patched_recv_audio(self, sink, callback, *args):
+    import select, time
+    self.user_timestamps = {}
+    self.starting_time = time.perf_counter()
+    pkt_count = 0
+    while self.recording:
+        ready, _, err = select.select([self.socket], [], [self.socket], 0.01)
+        if not ready:
+            continue
+        try:
+            data = self.socket.recv(4096)
+        except OSError:
+            self.stop_recording()
+            continue
+        pkt_count += 1
+        if pkt_count == 1 or pkt_count % 500 == 0:
+            _dave_log.debug("UDP packets received: %d, last len=%d, byte1=0x%02x",
+                            pkt_count, len(data), data[1] if len(data) > 1 else 0)
+        self.unpack_audio(data)
+    _dave_log.debug("recv_audio ended, total UDP packets: %d", pkt_count)
+    self.stopping_time = time.perf_counter()
+    self.sink.cleanup()
+    import asyncio
+    cb = asyncio.run_coroutine_threadsafe(callback(sink, *args), self.loop)
+    cb.result()
+
+_vc.VoiceClient.recv_audio = _patched_recv_audio
+
+# Patch unpack_audio to log what decrypted_data looks like
+_orig_unpack_audio = _vc.VoiceClient.unpack_audio
+
+def _patched_unpack_audio(self, data):
+    from discord.sinks import RawData as _RawData
+    if data[1] & 0x78 != 0x78:
+        _dave_log.debug("unpack_audio: rejected PT byte=0x%02x", data[1])
+        return
+    if self.paused:
+        return
+    try:
+        rdata = _RawData(data, self)
+    except Exception as e:
+        _dave_log.warning("RawData init failed: %s", e)
+        return
+    if rdata.decrypted_data == b"\xf8\xff\xfe":
+        _dave_log.debug("unpack_audio: silence frame, skipping")
+        return
+    _dave_log.debug("unpack_audio: decrypted len=%d, first4=%s, ssrc=%s",
+                    len(rdata.decrypted_data),
+                    rdata.decrypted_data[:4].hex() if rdata.decrypted_data else "N/A",
+                    rdata.ssrc)
+    self.decoder.decode(rdata)
+
+_vc.VoiceClient.unpack_audio = _patched_unpack_audio
 # ──────────────────────────────────────────────────────────────────────────────
 
 log = logging.getLogger(__name__)
@@ -126,6 +245,7 @@ class MultiUserSink(discord.sinks.WaveSink):
         pcm = data.data if hasattr(data, "data") else data
         with self._lock:
             if uid not in self._ring:
+                log.debug("First audio packet from user %s (%s), pcm_len=%d", uid, user.display_name, len(pcm))
                 self._ring[uid]  = RingBuffer(
                     RING_BUFFER_SEC, SAMPLE_RATE, CHANNELS, SAMPLE_WIDTH
                 )
@@ -155,6 +275,7 @@ class MultiUserSink(discord.sinks.WaveSink):
         paths = {}
         with self._lock:
             names = dict(self._names)
+        log.debug("save_all_users: audio_data has %d user(s): %s", len(self.audio_data), list(self.audio_data.keys()))
         for uid, audio in self.audio_data.items():
             wav_bytes = audio.file.getvalue()
             if not wav_bytes:
@@ -269,7 +390,6 @@ async def join(ctx: discord.ApplicationContext):
     await ctx.defer()
 
     _voice_client = await channel.connect()
-    await channel.guild.change_voice_state(channel=channel, self_deaf=False)
 
     # Wait up to 5 s for the voice WebSocket handshake to fully complete
     for _ in range(50):
@@ -282,6 +402,17 @@ async def join(ctx: discord.ApplicationContext):
         _voice_client = None
         await ctx.followup.send("❌ Failed to establish voice connection.")
         return
+
+    # Undeafen after connection is fully established so the bot can receive audio
+    await channel.guild.change_voice_state(channel=channel, self_deaf=False, self_mute=False)
+    await asyncio.sleep(0.5)   # let the gateway process the state change
+
+    me = channel.guild.me
+    vs = me.voice
+    log.debug("Voice state after undeafen: self_deaf=%s self_mute=%s channel=%s",
+              vs.self_deaf if vs else "N/A",
+              vs.self_mute if vs else "N/A",
+              vs.channel.name if vs and vs.channel else "N/A")
 
     safe_channel = re.sub(r"[^\w-]", "_", unidecode(channel.name))
     session_name = f"{safe_channel}_{datetime.now().strftime('%Y-%m-%d_%H-%M')}"
@@ -298,6 +429,7 @@ async def join(ctx: discord.ApplicationContext):
 
     _active_sink = MultiUserSink(_session_dir)
     _voice_client.start_recording(_active_sink, _on_recording_done, ctx.channel)
+    log.debug("Recording started on sink %s", _active_sink)
 
     await ctx.followup.send(f"🎙️ Started recording in **{channel.name}**. Session: `{session_name}`")
 

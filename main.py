@@ -49,6 +49,7 @@ logging.getLogger("gui").setLevel(logging.DEBUG)
 logging.getLogger("processor").setLevel(logging.DEBUG)
 logging.getLogger("db").setLevel(logging.DEBUG)
 logging.getLogger("discord").setLevel(logging.WARNING)
+logging.getLogger("dave_patch").setLevel(logging.DEBUG)
 
 # Route unhandled thread exceptions and stderr into the log
 _stderr_log = logging.getLogger("stderr")
