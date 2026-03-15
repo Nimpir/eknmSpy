@@ -1,0 +1,25 @@
+# Environment
+.env
+
+# Claude Code
+.claude/
+
+# Logs
+data/logs/
+
+# Recordings & session files
+data/recordings/
+
+# Database
+data/transcripts.db
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
