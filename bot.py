@@ -524,7 +524,7 @@ async def _on_recording_done(sink: MultiUserSink, channel, *args):
     pass  # handled in /leave
 
 
-async def _do_leave(notify_channel=None):
+async def _do_leave(notify_channel=None, interaction=None):
     """Stop recording, save files, fire callbacks. Shared by /leave and auto-leave."""
     global _active_sink, _voice_client, _session_id, _session_dir, _session_log_handler, _dave_handler
 
@@ -546,11 +546,14 @@ async def _do_leave(notify_channel=None):
     sid = _session_id
     close_session(sid)
 
-    if notify_channel:
-        await notify_channel.send(
-            f"⏹️ Recording stopped. Session ID: **{sid}**\n"
-            f"Use `/transcript` to generate and retrieve the transcript."
-        )
+    msg = (
+        f"⏹️ Recording stopped. Session ID: **{sid}**\n"
+        f"Use `/transcript` to generate and retrieve the transcript."
+    )
+    if interaction is not None:
+        await interaction.followup.send(msg)
+    elif notify_channel:
+        await notify_channel.send(msg)
 
     if on_session_stopped:
         on_session_stopped(sid, str(mixed_path), speaker_map)
@@ -619,7 +622,7 @@ async def leave(ctx: discord.ApplicationContext):
         _auto_leave_task = None
 
     await ctx.defer()
-    await _do_leave(notify_channel=ctx.channel)
+    await _do_leave(interaction=ctx)
 
 
 @bot.slash_command(name="save", description="Save the last N minutes of audio (1-10)")

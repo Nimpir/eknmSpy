@@ -43,6 +43,7 @@ class App(tk.Tk):
         self.resizable(True, True)
         init_db()
         self._bot_thread = None
+        self._bot_discord = None  # reference to the discord Bot instance
         self._build_ui()
         self._refresh_sessions()
         if os.getenv("DISCORD_TOKEN", ""):
@@ -420,6 +421,23 @@ class App(tk.Tk):
         if not token:
             messagebox.showerror("Error", "Enter a Discord Bot Token")
             return
+
+        # Stop any previously running bot thread before starting a new one
+        if self._bot_thread and self._bot_thread.is_alive():
+            if self._bot_discord is not None:
+                try:
+                    import asyncio
+                    loop = self._bot_discord.loop
+                    if loop and loop.is_running():
+                        asyncio.run_coroutine_threadsafe(
+                            self._bot_discord.close(), loop
+                        )
+                except Exception:
+                    pass
+            self._bot_thread.join(timeout=5)
+            if self._bot_thread.is_alive():
+                log.warning("Old bot thread did not stop cleanly — process restart recommended")
+
         self._start_bot_btn.config(state="disabled")
         self._bot_status.config(text="● Starting...", foreground=YELLOW)
 
@@ -447,6 +465,7 @@ class App(tk.Tk):
 
         def run():
             try:
+                self._bot_discord = discord_bot.bot
                 self.after(0, lambda: self._bot_status.config(
                     text="● Running", foreground=GREEN))
                 discord_bot.run_bot(token)
@@ -456,6 +475,8 @@ class App(tk.Tk):
                 self.after(0, lambda: self._bot_status.config(
                     text="● Error", foreground=RED))
                 self.after(0, lambda: self._start_bot_btn.config(state="normal"))
+            finally:
+                self._bot_discord = None
 
         self._bot_thread = threading.Thread(target=run, daemon=True)
         self._bot_thread.start()

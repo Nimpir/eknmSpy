@@ -137,3 +137,4 @@ Only works while recording is active. Clips from the ring buffer — all users' 
 - The ring buffer holds up to 10 minutes per user
 - The clip is a stereo 48kHz mix of all users active during that window
 - The file is generated in memory and not saved to disk
+- Peak memory during clip generation is approximately 12 MB per user-minute (48 kHz stereo int16). A 10-minute clip with 4 active users uses ~115 MB.

@@ -24,10 +24,12 @@ log = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-WHISPER_MODEL   = "large-v3"          # best quality; fits in 12 GB VRAM
-DEVICE          = "cuda" if torch.cuda.is_available() else "cpu"
-HF_TOKEN        = os.getenv("HF_TOKEN", "")   # needed for pyannote models
-LLM_MODEL       = os.getenv("LLM_MODEL", "qwen2.5:7b")  # local ollama model
+WHISPER_MODEL        = "large-v3"          # best quality; fits in 12 GB VRAM
+DEVICE               = "cuda" if torch.cuda.is_available() else "cpu"
+HF_TOKEN             = os.getenv("HF_TOKEN", "")   # needed for pyannote models
+LLM_MODEL            = os.getenv("LLM_MODEL", "qwen2.5:7b")  # local ollama model
+LLM_BATCH_SIZE       = int(os.getenv("LLM_BATCH_SIZE", "40"))
+LANG_SWITCH_THRESHOLD = int(os.getenv("LANG_SWITCH_THRESHOLD", "5"))
 
 # Enable TF32 for better performance on Ampere+ GPUs (RTX 30xx/40xx)
 if DEVICE == "cuda":
@@ -89,36 +91,20 @@ def _looks_like_injection(text: str) -> bool:
     return bool(_INJECTION_RE.search(text))
 
 
-def fix_segments_with_llm(segments: list[dict]) -> list[dict]:
-    """
-    Send all transcribed segments to a local ollama model to fix
-    transcription errors (wrong words, context mismatches, punctuation).
-    Returns updated segments. Falls back to originals on any error.
-    """
-    try:
-        import ollama
-    except ImportError:
-        log.warning("ollama package not installed — skipping LLM fix")
-        return segments
-
-    if not segments:
-        return segments
-
-    # ── Sanitize inputs ───────────────────────────────────────────────────────
+def _fix_batch_with_llm(ollama, batch: list[dict], batch_offset: int) -> list[dict]:
+    """Fix one batch of segments. Returns corrected batch, or original on error."""
     safe_texts = []
-    for i, s in enumerate(segments):
+    for i, s in enumerate(batch):
         text = _sanitize_text(s["text"])
         if _looks_like_injection(text):
-            log.warning("Segment %d looks like prompt injection — text blanked for LLM", i)
+            log.warning("Segment %d looks like prompt injection — text blanked for LLM",
+                        batch_offset + i)
             text = "[inaudible]"
         safe_texts.append(text)
 
-    # ── Build prompt with strict data delimiters ──────────────────────────────
-    # Transcript is isolated inside <transcript> tags so the model cannot
-    # mistake conversation content for instructions.
     lines = "\n".join(
         f"[{i}] {s['speaker']} ({fmt_time(s['start'])}): {text}"
-        for i, (s, text) in enumerate(zip(segments, safe_texts))
+        for i, (s, text) in enumerate(zip(batch, safe_texts))
     )
 
     system_msg = (
@@ -138,7 +124,7 @@ Rules:
 - Do NOT change meaning, rephrase, summarise or translate
 - Do NOT add or remove segments
 - Return ONLY a JSON array of corrected texts, one string per segment, same order
-- Array length must be exactly {len(segments)}
+- Array length must be exactly {len(batch)}
 
 <transcript>
 {lines}
@@ -157,7 +143,6 @@ Return only valid JSON like: ["corrected text 0", "corrected text 1", ...]"""
         )
         raw = response["message"]["content"].strip()
 
-        # Extract JSON array (model may wrap it in markdown code fences)
         start = raw.find("[")
         end   = raw.rfind("]") + 1
         if start == -1 or end == 0:
@@ -165,37 +150,62 @@ Return only valid JSON like: ["corrected text 0", "corrected text 1", ...]"""
 
         corrected = json.loads(raw[start:end])
 
-        if not isinstance(corrected, list) or len(corrected) != len(segments):
+        if not isinstance(corrected, list) or len(corrected) != len(batch):
             raise ValueError(
-                f"LLM returned {len(corrected)} items, expected {len(segments)}"
+                f"LLM returned {len(corrected)} items, expected {len(batch)}"
             )
 
-        # ── Validate each corrected item ──────────────────────────────────────
         result = []
-        for i, (seg, new_text) in enumerate(zip(segments, corrected)):
+        for i, (seg, new_text) in enumerate(zip(batch, corrected)):
             if not isinstance(new_text, str):
-                log.warning("LLM segment %d is not a string — keeping original", i)
+                log.warning("LLM segment %d is not a string — keeping original",
+                            batch_offset + i)
                 result.append(seg)
                 continue
             new_text = new_text.strip()
-            # Reject if the LLM produced something suspiciously long (likely hallucination)
             if len(new_text) > len(seg["text"]) * 3 + 200:
-                log.warning("LLM segment %d suspiciously long — keeping original", i)
+                log.warning("LLM segment %d suspiciously long — keeping original",
+                            batch_offset + i)
                 result.append(seg)
                 continue
             result.append({**seg, "text": new_text or seg["text"]})
 
-        log.info("LLM fix applied to %d segments using %s", len(result), LLM_MODEL)
         return result
 
     except Exception as e:
-        log.warning("LLM fix failed (%s) — using original transcription", e)
+        log.warning("LLM batch starting at segment %d failed (%s) — keeping originals",
+                    batch_offset, e)
+        return batch
+
+
+def fix_segments_with_llm(segments: list[dict]) -> list[dict]:
+    """
+    Send transcribed segments to a local ollama model in batches of LLM_BATCH_SIZE
+    to fix transcription errors. Falls back to originals on any error.
+    """
+    try:
+        import ollama
+    except ImportError:
+        log.warning("ollama package not installed — skipping LLM fix")
         return segments
+
+    if not segments:
+        return segments
+
+    result = []
+    for offset in range(0, len(segments), LLM_BATCH_SIZE):
+        batch = segments[offset:offset + LLM_BATCH_SIZE]
+        log.info("LLM fix: batch %d–%d of %d", offset + 1,
+                 min(offset + LLM_BATCH_SIZE, len(segments)), len(segments))
+        result.extend(_fix_batch_with_llm(ollama, batch, offset))
+
+    log.info("LLM fix applied to %d segments using %s", len(result), LLM_MODEL)
+    return result
 
 
 # ── Language phase detection ──────────────────────────────────────────────────
 
-def _smooth_language_phases(raw_langs: list, min_switch: int = 5) -> list:
+def _smooth_language_phases(raw_langs: list, min_switch: int = LANG_SWITCH_THRESHOLD) -> list:
     """
     Convert per-segment raw language detections into stable phases.
 
@@ -291,12 +301,24 @@ def _map_speakers_to_discord(session_dir: Path,
         candidates = {uid: e for uid, e in votes[speaker].items() if uid not in used_uids}
         if not candidates:
             continue
-        best_uid = max(candidates, key=candidates.__getitem__)
+        sorted_cands = sorted(candidates.items(), key=lambda x: x[1], reverse=True)
+        best_uid, best_energy = sorted_cands[0]
+        if len(sorted_cands) >= 2:
+            second_energy = sorted_cands[1][1]
+            if second_energy > 0 and best_energy / second_energy < 1.3:
+                second_name = f"{user_audio[sorted_cands[1][0]][0]}({sorted_cands[1][0]})"
+                log.warning(
+                    "Ambiguous speaker mapping for %s: top=%s(%.1f) vs %s(%.1f) — ratio=%.2f",
+                    speaker,
+                    f"{user_audio[best_uid][0]}({best_uid})", best_energy,
+                    second_name, second_energy,
+                    best_energy / second_energy,
+                )
         display = f"{user_audio[best_uid][0]}({best_uid})"
         speaker_to_name[speaker] = display
         used_uids.add(best_uid)
         log.info("Speaker mapping: %s → %s (energy=%.1f)",
-                 speaker, display, candidates[best_uid])
+                 speaker, display, best_energy)
 
     return speaker_to_name
 
@@ -318,150 +340,157 @@ def process_session(audio_path: str, session_id: int,
         log.debug("[%3d%%] %s", pct, step)
 
     _progress("Loading models...", 0)
-    whisper_model = load_whisper()
-    diarizer      = load_diarizer()
-
-    # ── Step 1: diarization ───────────────────────────────────────────────────
-    _progress("Diarization (who speaks when)...", 20)
-    sample_rate, samples = scipy.io.wavfile.read(audio_path)
-    if samples.size == 0:
-        raise ValueError(f"Audio file is empty (0 samples): {audio_path}\nNo audio was recorded — check that DAVE decryption is working.")
-    waveform = torch.from_numpy(samples).float()
-    if waveform.ndim == 1:
-        waveform = waveform.unsqueeze(0)
-    else:
-        waveform = waveform.T
-    peak = waveform.abs().max().item()
-    if peak > 0:
-        waveform /= peak
-    # Count Discord users who actually spoke (non-empty WAV = audio recorded)
-    # This handles sessions where users joined/left — e.g. 2 speakers for first
-    # 30 min, then 2 more join: total 4 user WAVs → num_speakers=4 is correct.
-    # Users who joined but never spoke produce near-empty WAVs — skip those.
-    WAV_HEADER_BYTES = 44
-    session_dir  = Path(audio_path).parent
-    num_speakers = sum(
-        1 for p in session_dir.glob("*.wav")
-        if p.name != "mixed_mono.wav"
-        and p.stem.rsplit("_", 1)[-1].isdigit()
-        and p.stat().st_size > WAV_HEADER_BYTES
-    ) or None   # None = let pyannote decide (fallback if no user WAVs)
-    if num_speakers:
-        log.info("Constraining diarization to %d speaker(s) (Discord users)", num_speakers)
-
-    diarization = diarizer({"waveform": waveform, "sample_rate": sample_rate},
-                           num_speakers=num_speakers)
-
-    # Build speaker turn list: [(start, end, speaker_label), ...]
-    turns = [
-        (turn.start, turn.end, speaker)
-        for turn, _, speaker in diarization.speaker_diarization.itertracks(yield_label=True)
-    ]
-
-    # Map SPEAKER_XX → Discord display name using per-user audio energy
-    speaker_name_map = _map_speakers_to_discord(Path(audio_path).parent, turns)
-    if speaker_name_map:
-        turns = [(s, e, speaker_name_map.get(sp, sp)) for s, e, sp in turns]
-    _progress(f"Found {len(set(t[2] for t in turns))} speakers, {len(turns)} segments", 40)
-
-    # ── Step 2: load audio for whisper ────────────────────────────────────────
-    # Reuse the scipy-loaded samples (already in memory) instead of re-reading.
-    # mixed_mono.wav is always 16kHz mono; convert PCM int to float32 [-1, 1].
-    _progress("Loading audio for transcription...", 45)
-    if samples.ndim > 1:
-        _wav_mono = samples.mean(axis=1)
-    else:
-        _wav_mono = samples
-    if np.issubdtype(samples.dtype, np.integer):
-        audio = _wav_mono.astype(np.float32) / float(np.iinfo(samples.dtype).max)
-    else:
-        audio = _wav_mono.astype(np.float32)
-    sr = sample_rate  # 16000 for mixed_mono.wav
-
-    # ── Step 2b: detect language per segment, then smooth into phases ─────────
-    _progress("Detecting language phases...", 47)
-    raw_langs = []
-    for start, end, _ in turns:
-        s     = int(start * sr)
-        e     = int(end   * sr)
-        chunk = audio[s:e]
-        if len(chunk) < sr * 0.3:
-            raw_langs.append(None)
-            continue
-        mel = whisper.log_mel_spectrogram(
-            whisper.pad_or_trim(chunk), n_mels=whisper_model.dims.n_mels
-        ).to(DEVICE)
-        _, probs = whisper_model.detect_language(mel)
-        raw_langs.append(max(probs, key=probs.get))
-
-    smoothed_langs = _smooth_language_phases(raw_langs)
-    log.info("Language phases: %s", dict(Counter(smoothed_langs)))
-
-    # ── Step 3: transcribe each turn with its smoothed language ───────────────
-    _progress("Transcribing...", 50)
-    segments = []
-    total = len(turns)
-
-    for i, (start, end, speaker) in enumerate(turns):
-        pct = 50 + int((i / total) * 45)
-        if i % 10 == 0:
-            _progress(f"Transcribing segment {i+1}/{total}...", pct)
-
-        # slice audio for this turn
-        s = int(start * sr)
-        e = int(end   * sr)
-        chunk = audio[s:e]
-
-        if len(chunk) < sr * 0.3:   # skip < 300ms (noise/breath)
-            continue
-
-        forced_lang = smoothed_langs[i] if i < len(smoothed_langs) else None
-
-        result = whisper_model.transcribe(
-            chunk,
-            language=forced_lang,   # phase-smoothed language
-            task="transcribe",
-            fp16=(DEVICE == "cuda"),
-            verbose=False
-        )
-        text = result["text"].strip()
-
-        if not text:
-            continue
-
-        segments.append({
-            "speaker": speaker,
-            "start":   round(start, 2),
-            "end":     round(end,   2),
-            "text":    text
-        })
-
-    # ── Step 4: LLM fix ──────────────────────────────────────────────────────
-    _progress("Fixing text with LLM...", 92)
-    segments = fix_segments_with_llm(segments)
-
-    # ── Step 5: save to DB ────────────────────────────────────────────────────
-    _progress("Saving to database...", 97)
-    insert_segments(session_id, segments)
-
-    # ── Step 6: unload models to free VRAM ───────────────────────────────────
-    _progress("Unloading models...", 99)
-    del whisper_model, diarizer
-    if DEVICE == "cuda":
-        torch.cuda.empty_cache()
-        log.info("Models unloaded, VRAM freed. Reserved: %.0f MB",
-                 torch.cuda.memory_reserved() / 1024 / 1024)
-
-    # Ask ollama to unload its model immediately (keep_alive=0)
+    whisper_model = None
+    diarizer      = None
     try:
-        import ollama
-        ollama.chat(model=LLM_MODEL,
-                    messages=[{"role": "user", "content": ""}],
-                    options={"num_predict": 0},
-                    keep_alive=0)
-        log.info("Ollama model %s unloaded", LLM_MODEL)
-    except Exception:
-        pass  # ollama not running or model not loaded — no-op
+        whisper_model = load_whisper()
+        diarizer      = load_diarizer()
+
+        # ── Step 1: diarization ───────────────────────────────────────────────
+        _progress("Diarization (who speaks when)...", 20)
+        sample_rate, samples = scipy.io.wavfile.read(audio_path)
+        if samples.size == 0:
+            raise ValueError(f"Audio file is empty (0 samples): {audio_path}\nNo audio was recorded — check that DAVE decryption is working.")
+        waveform = torch.from_numpy(samples).float()
+        if waveform.ndim == 1:
+            waveform = waveform.unsqueeze(0)
+        else:
+            waveform = waveform.T
+        peak = waveform.abs().max().item()
+        if peak > 0:
+            waveform /= peak
+        # Count Discord users who actually spoke (non-empty WAV = audio recorded)
+        # This handles sessions where users joined/left — e.g. 2 speakers for first
+        # 30 min, then 2 more join: total 4 user WAVs → num_speakers=4 is correct.
+        # Users who joined but never spoke produce near-empty WAVs — skip those.
+        WAV_HEADER_BYTES = 44
+        session_dir  = Path(audio_path).parent
+        num_speakers = sum(
+            1 for p in session_dir.glob("*.wav")
+            if p.name != "mixed_mono.wav"
+            and p.stem.rsplit("_", 1)[-1].isdigit()
+            and p.stat().st_size > WAV_HEADER_BYTES
+        ) or None   # None = let pyannote decide (fallback if no user WAVs)
+        if num_speakers:
+            log.info("Constraining diarization to %d speaker(s) (Discord users)", num_speakers)
+
+        diarization = diarizer({"waveform": waveform, "sample_rate": sample_rate},
+                               num_speakers=num_speakers)
+
+        # Build speaker turn list: [(start, end, speaker_label), ...]
+        turns = [
+            (turn.start, turn.end, speaker)
+            for turn, _, speaker in diarization.speaker_diarization.itertracks(yield_label=True)
+        ]
+
+        # Map SPEAKER_XX → Discord display name using per-user audio energy
+        speaker_name_map = _map_speakers_to_discord(Path(audio_path).parent, turns)
+        if speaker_name_map:
+            turns = [(s, e, speaker_name_map.get(sp, sp)) for s, e, sp in turns]
+        _progress(f"Found {len(set(t[2] for t in turns))} speakers, {len(turns)} segments", 40)
+
+        # ── Step 2: load audio for whisper ────────────────────────────────────
+        # Reuse the scipy-loaded samples (already in memory) instead of re-reading.
+        # mixed_mono.wav is always 16kHz mono; convert PCM int to float32 [-1, 1].
+        _progress("Loading audio for transcription...", 45)
+        if samples.ndim > 1:
+            _wav_mono = samples.mean(axis=1)
+        else:
+            _wav_mono = samples
+        if np.issubdtype(samples.dtype, np.integer):
+            audio = _wav_mono.astype(np.float32) / float(np.iinfo(samples.dtype).max)
+        else:
+            audio = _wav_mono.astype(np.float32)
+        sr = sample_rate  # 16000 for mixed_mono.wav
+
+        # ── Step 2b: detect language per segment, then smooth into phases ──────
+        _progress("Detecting language phases...", 47)
+        raw_langs = []
+        for start, end, _ in turns:
+            s     = int(start * sr)
+            e     = int(end   * sr)
+            chunk = audio[s:e]
+            if len(chunk) < sr * 0.3:
+                raw_langs.append(None)
+                continue
+            mel = whisper.log_mel_spectrogram(
+                whisper.pad_or_trim(chunk), n_mels=whisper_model.dims.n_mels
+            ).to(DEVICE)
+            _, probs = whisper_model.detect_language(mel)
+            raw_langs.append(max(probs, key=probs.get))
+
+        smoothed_langs = _smooth_language_phases(raw_langs)
+        log.info("Language phases: %s", dict(Counter(smoothed_langs)))
+
+        # ── Step 3: transcribe each turn with its smoothed language ────────────
+        _progress("Transcribing...", 50)
+        segments = []
+        total = len(turns)
+
+        for i, (start, end, speaker) in enumerate(turns):
+            pct = 50 + int((i / total) * 45)
+            if i % 10 == 0:
+                _progress(f"Transcribing segment {i+1}/{total}...", pct)
+
+            # slice audio for this turn
+            s = int(start * sr)
+            e = int(end   * sr)
+            chunk = audio[s:e]
+
+            if len(chunk) < sr * 0.3:   # skip < 300ms (noise/breath)
+                continue
+
+            forced_lang = smoothed_langs[i] if i < len(smoothed_langs) else None
+
+            result = whisper_model.transcribe(
+                chunk,
+                language=forced_lang,   # phase-smoothed language
+                task="transcribe",
+                fp16=(DEVICE == "cuda"),
+                verbose=False
+            )
+            text = result["text"].strip()
+
+            if not text:
+                continue
+
+            segments.append({
+                "speaker": speaker,
+                "start":   round(start, 2),
+                "end":     round(end,   2),
+                "text":    text
+            })
+
+        # ── Step 4: LLM fix ───────────────────────────────────────────────────
+        _progress("Fixing text with LLM...", 92)
+        segments = fix_segments_with_llm(segments)
+
+        # ── Step 5: save to DB ────────────────────────────────────────────────
+        _progress("Saving to database...", 97)
+        insert_segments(session_id, segments)
+
+    finally:
+        # ── Step 6: unload models to free VRAM (always runs) ─────────────────
+        _progress("Unloading models...", 99)
+        if whisper_model is not None:
+            del whisper_model
+        if diarizer is not None:
+            del diarizer
+        if DEVICE == "cuda":
+            torch.cuda.empty_cache()
+            log.info("Models unloaded, VRAM freed. Reserved: %.0f MB",
+                     torch.cuda.memory_reserved() / 1024 / 1024)
+
+        # Ask ollama to unload its model immediately (keep_alive=0)
+        try:
+            import ollama
+            ollama.chat(model=LLM_MODEL,
+                        messages=[{"role": "user", "content": ""}],
+                        options={"num_predict": 0},
+                        keep_alive=0)
+            log.info("Ollama model %s unloaded", LLM_MODEL)
+        except Exception:
+            pass  # ollama not running or model not loaded — no-op
 
     _progress("Done!", 100)
     return segments

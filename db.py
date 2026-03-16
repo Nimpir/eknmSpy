@@ -48,6 +48,9 @@ def init_db():
                 INSERT INTO segments_fts(rowid, text, speaker)
                 VALUES (new.id, new.text, new.speaker);
             END;
+
+            CREATE INDEX IF NOT EXISTS idx_segments_session ON segments(session_id);
+            CREATE INDEX IF NOT EXISTS idx_sessions_guild ON sessions(guild);
         """)
 
 

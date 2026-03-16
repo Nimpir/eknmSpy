@@ -62,6 +62,7 @@ class DaveHandler:
         self._channel_id = channel_id
         self._session: Optional[DaveSession] = None
         self._ws = None
+        self._passthrough_state: dict[int, bool] = {}  # user_id → last passthrough value
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -290,6 +291,11 @@ class DaveHandler:
         if self._session is None:
             return True
         try:
-            return self._session.can_passthrough(user_id)
+            result = self._session.can_passthrough(user_id)
         except Exception:
-            return True
+            result = True
+        prev = self._passthrough_state.get(user_id)
+        if prev is None or prev != result:
+            self._passthrough_state[user_id] = result
+            log.info("DAVE passthrough changed: user=%s passthrough=%s", user_id, result)
+        return result

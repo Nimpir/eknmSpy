@@ -18,4 +18,7 @@ torchaudio>=2.1.0
 # Utilities
 unidecode>=1.3.0
 
+# DAVE MLS decryption (C extension — required for Discord E2E voice encryption)
+davey
+
 # (CUDA wheels are installed separately — see README)

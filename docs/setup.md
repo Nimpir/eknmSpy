@@ -87,6 +87,21 @@ pip install torch torchaudio --force-reinstall --index-url https://download.pyto
 pip install -r requirements.txt
 ```
 
+`davey` (a C extension for DAVE MLS decryption) is included in `requirements.txt`. If a pre-built wheel is available for your platform it installs automatically. If not, build from source:
+
+```bash
+pip install davey
+# or, if installing from the davey source repo:
+pip install .
+```
+
+Verify the install:
+```bash
+python -c "from davey import DaveSession; print('davey ok')"
+```
+
+Without `davey` the bot will connect but record silence — no error is printed, the audio file simply contains no data.
+
 ---
 
 ## Step 6 — ollama (optional, for LLM post-processing)
